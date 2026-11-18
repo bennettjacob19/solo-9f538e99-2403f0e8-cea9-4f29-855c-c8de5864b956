@@ -399,3 +399,335 @@ def test_health_and_docs(server):
     assert health["status"] == "ok" and health["max_parallel"] == 2
     assert server.client.get("/docs").status_code == 200
     assert server.client.get("/openapi.json").status_code == 200
+
+
+# ------------------------------------------------------- 10. 人工放行门禁
+
+def _wait_awaiting(client: httpx.Client, build_id: int, step_uid: str,
+                   timeout: float = 20) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        detail = client.get(f"/builds/{build_id}").json()
+        sm = step_map(detail)
+        if sm.get(step_uid, {}).get("status") == "awaiting_approval":
+            return detail
+        time.sleep(0.05)
+    raise AssertionError(f"门禁 {step_uid} 未进入待签核")
+
+
+def _approve(client: httpx.Client, build_id: int, step_uid: str,
+             decision: str, **extra) -> httpx.Response:
+    return client.post(
+        f"/builds/{build_id}/steps/{step_uid}/approval",
+        json={"decision": decision, **extra},
+    )
+
+
+def test_gate_blocks_descendants_until_approved(server):
+    bid = submit(server.client, "gate-approve", [
+        step("prepare", "echo prepared > artifact.txt"),
+        {**step("signoff", "test -f artifact.txt && echo report-ok", ["prepare"]),
+         "approval_required": True},
+        step("package", "test -f artifact.txt && echo packaged", ["signoff"]),
+    ])
+    detail = _wait_awaiting(server.client, bid, "signoff")
+    sm = step_map(detail)
+    assert detail["status"] == "running"
+    assert sm["signoff"]["approval_required"] is True
+    assert sm["signoff"]["approval_status"] == "pending"
+    assert sm["prepare"]["status"] == "succeeded"
+    assert sm["package"]["status"] == "pending"  # 批准前后代不得启动
+
+    listing = server.client.get("/approvals").json()
+    entry = next(e for e in listing if e["build_id"] == bid)
+    assert entry["step_id"] == "signoff" and entry["build_status"] == "running"
+    assert entry["command"].startswith("test -f artifact.txt")
+
+    r = _approve(server.client, bid, "signoff", "approve",
+                 decided_by="qa-1", comment="测试通过")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["approval_status"] == "approved"
+    assert body["approval_decided_by"] == "qa-1"
+
+    detail = wait_build(server.client, bid, timeout=30)
+    sm = step_map(detail)
+    assert detail["status"] == "succeeded"
+    assert sm["signoff"]["status"] == "succeeded"
+    assert sm["package"]["status"] == "succeeded"
+    log = server.client.get(f"/builds/{bid}/steps/signoff/logs").json()
+    assert "report-ok" in log["content"]
+    assert "批准签核" in log["content"]
+
+
+def test_gate_reject_skips_descendants(server):
+    bid = submit(server.client, "gate-reject", [
+        step("build", "echo built"),
+        {**step("signoff", "true", ["build"]), "approval_required": True},
+        step("package", "echo should-not-run", ["signoff"]),
+    ])
+    _wait_awaiting(server.client, bid, "signoff")
+    r = _approve(server.client, bid, "signoff", "reject",
+                 decided_by="qa-2", comment="质检不合格")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+    detail = wait_build(server.client, bid, timeout=30)
+    sm = step_map(detail)
+    assert detail["status"] == "failed"
+    assert sm["signoff"]["status"] == "rejected"
+    assert sm["signoff"]["approval_status"] == "rejected"
+    assert sm["package"]["status"] == "skipped"
+    log = server.client.get(f"/builds/{bid}/steps/package/logs").json()
+    assert "should-not-run" not in command_output(log)
+
+
+def test_gate_only_one_decision_accepted(server):
+    bid = submit(server.client, "gate-once", [
+        {**step("gate", "true"), "approval_required": True},
+        step("after", "echo done", ["gate"]),
+    ])
+    _wait_awaiting(server.client, bid, "gate")
+    first = _approve(server.client, bid, "gate", "approve")
+    assert first.status_code == 200
+    second = _approve(server.client, bid, "gate", "reject")
+    assert second.status_code == 409
+    detail = wait_build(server.client, bid, timeout=30)
+    assert detail["status"] == "succeeded"
+    assert step_map(detail)["gate"]["approval_status"] == "approved"
+
+
+def test_gate_rejects_bad_requests(server):
+    bid = submit(server.client, "gate-errors", [
+        {**step("gate", "true"), "approval_required": True},
+    ])
+    _wait_awaiting(server.client, bid, "gate")
+    assert _approve(server.client, 999999, "gate", "approve").status_code == 404
+    assert _approve(server.client, bid, "ghost", "approve").status_code == 404
+    r = server.client.post(
+        f"/builds/{bid}/steps/gate/approval", json={"decision": "maybe"}
+    )
+    assert r.status_code == 422
+    # 非门禁步骤上的签核不受理
+    bid2 = submit(server.client, "gate-none", [step("plain", "true")])
+    wait_build(server.client, bid2)
+    assert _approve(server.client, bid2, "plain", "approve").status_code == 409
+
+
+def test_cancel_while_awaiting_approval_blocks_later_approval(server):
+    bid = submit(server.client, "gate-cancel", [
+        {**step("gate", "true"), "approval_required": True},
+        step("after", "echo should-not-run", ["gate"]),
+    ])
+    _wait_awaiting(server.client, bid, "gate")
+    r = server.client.post(f"/builds/{bid}/cancel")
+    assert r.status_code == 200
+    detail = wait_build(server.client, bid, timeout=30)
+    assert detail["status"] == "cancelled"
+    sm = step_map(detail)
+    assert sm["gate"]["status"] == "cancelled"
+    assert sm["gate"]["approval_status"] == "cancelled"
+    assert sm["after"]["status"] == "cancelled"
+    # 取消后签核不再受理，且不得因迟到的批准补跑后代
+    blocked = _approve(server.client, bid, "gate", "approve")
+    assert blocked.status_code == 409
+    log = server.client.get(f"/builds/{bid}/steps/after/logs").json()
+    assert "should-not-run" not in command_output(log)
+    detail = server.client.get(f"/builds/{bid}").json()
+    assert step_map(detail)["gate"]["status"] == "cancelled"
+
+
+def test_cancel_right_after_approval_does_not_start_released_descendant(server):
+    bid = submit(server.client, "gate-approve-cancel", [
+        {**step("gate", "true"), "approval_required": True},
+        # 先睡再写标记：若后代被启动，取消必须在其写标记前终止整个进程组
+        step("after", "sleep 0.5; echo released > released.txt; sleep 30", ["gate"]),
+    ])
+    _wait_awaiting(server.client, bid, "gate")
+    assert _approve(server.client, bid, "gate", "approve").status_code == 200
+    # 批准后立刻取消：已取消构建的后代命令不得真正产出，已启动的必须被终止
+    assert server.client.post(f"/builds/{bid}/cancel").status_code == 200
+    detail = wait_build(server.client, bid, timeout=30)
+    assert detail["status"] == "cancelled"
+    assert step_map(detail)["after"]["status"] == "cancelled"
+    marker = server.data_dir / "workdir" / str(bid) / "released.txt"
+    assert not marker.exists(), "已取消构建的后代命令被启动了"
+
+
+def test_gate_waiting_does_not_occupy_execution_slots(server):
+    # 门禁等待签核时不得占用两个名额：两个独立构建仍应并行执行并完成
+    gate_bid = submit(server.client, "gate-holding", [
+        {**step("gate", "true"), "approval_required": True},
+    ])
+    _wait_awaiting(server.client, gate_bid, "gate")
+    t0 = time.time()
+    two = [
+        submit(server.client, f"slot-{i}", [step("s", "sleep 1")])
+        for i in range(2)
+    ]
+    for bid in two:
+        wait_build(server.client, bid, timeout=15)
+    elapsed = time.time() - t0
+    assert elapsed < 3.5, f"门禁占用名额，两个独立构建耗时 {elapsed:.2f}s"
+    # 独立分支照常运行；门禁构建仍待签核
+    listing = server.client.get("/approvals").json()
+    assert any(e["build_id"] == gate_bid for e in listing)
+    assert _approve(server.client, gate_bid, "gate", "reject").status_code == 200
+    assert wait_build(server.client, gate_bid)["status"] == "failed"
+
+
+def test_restart_expires_pending_approval_without_rerun(tmp_path_factory):
+    """旧签核结论已在库中但后代尚未放行时，重启不得让后代补跑。"""
+    data_dir = tmp_path_factory.mktemp("gate-restart-data")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        bid = submit(srv.client, "gate-restart", [
+            step("prep", "echo prepared > prep.txt"),
+            {**step("gate", "true", ["prep"]), "approval_required": True},
+            step("package", "echo should-not-run > package-ran.txt", ["gate"]),
+        ])
+        _wait_awaiting(srv.client, bid, "gate")
+    finally:
+        srv.stop()
+
+    # 在停机状态下模拟"旧签核已受理但后代尚未启动"：直接改写库中门禁为已批准。
+    import sqlite3
+    now = "2026-01-01T00:00:00+00:00"
+    conn = sqlite3.connect(data_dir / "pipeline.db")
+    try:
+        conn.execute(
+            "UPDATE steps SET status='succeeded', approval_status='approved', "
+            "approval_decided_at=?, approval_decided_by='old-qa' "
+            "WHERE build_id=? AND step_uid='gate'",
+            (now, bid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        detail = srv2.client.get(f"/builds/{bid}").json()
+        assert detail["status"] == "interrupted"
+        sm = step_map(detail)
+        # 门禁自身已有结论（批准），重启不改写其终态；关键是后代不得补跑
+        assert sm["gate"]["status"] == "succeeded"
+        assert sm["gate"]["approval_status"] == "approved"
+        assert sm["package"]["status"] == "interrupted"
+        # 旧签核不得使步骤补跑；重启后签核不再受理
+        assert _approve(srv2.client, bid, "gate", "approve").status_code == 409
+        marker = data_dir / "workdir" / str(bid) / "package-ran.txt"
+        assert not marker.exists()
+        log = srv2.client.get(f"/builds/{bid}/steps/package/logs").json()
+        assert "should-not-run" not in command_output(log)
+    finally:
+        srv2.stop()
+
+    # 恢复后的新构建仍可正常走门禁
+    srv3 = ServerHarness(data_dir, port)
+    srv3.start()
+    try:
+        new_id = submit(srv3.client, "gate-after-restart", [
+            {**step("g2", "true"), "approval_required": True},
+            step("tail", "echo tail-ran", ["g2"]),
+        ])
+        _wait_awaiting(srv3.client, new_id, "g2")
+        assert _approve(srv3.client, new_id, "g2", "approve").status_code == 200
+        assert wait_build(srv3.client, new_id)["status"] == "succeeded"
+    finally:
+        srv3.stop()
+
+
+def test_restart_marks_unresolved_pending_approval_expired(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("gate-expire-data")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        bid = submit(srv.client, "gate-expire", [
+            {**step("gate", "true"), "approval_required": True},
+        ])
+        _wait_awaiting(srv.client, bid, "gate")
+    finally:
+        srv.stop()
+
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        detail = srv2.client.get(f"/builds/{bid}").json()
+        sm = step_map(detail)
+        assert sm["gate"]["status"] == "interrupted"
+        assert sm["gate"]["approval_status"] == "expired"
+        assert srv2.client.get("/approvals").json() == []
+    finally:
+        srv2.stop()
+
+
+def test_old_database_is_migrated_with_approval_columns(tmp_path_factory):
+    """升级前创建的库缺少签核列，启动时必须自动补齐且不丢旧数据。"""
+    import sqlite3
+
+    data_dir = tmp_path_factory.mktemp("legacy-data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(data_dir / "pipeline.db")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, status TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                detail TEXT, created_at TEXT NOT NULL,
+                started_at TEXT, finished_at TEXT
+            );
+            CREATE TABLE steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                build_id INTEGER NOT NULL, step_uid TEXT NOT NULL,
+                command TEXT NOT NULL, depends_on TEXT NOT NULL,
+                timeout_seconds REAL NOT NULL, status TEXT NOT NULL,
+                exit_code INTEGER, detail TEXT, log_path TEXT,
+                pid INTEGER, pgid INTEGER, proc_starttime REAL,
+                started_at TEXT, finished_at TEXT,
+                UNIQUE(build_id, step_uid),
+                FOREIGN KEY(build_id) REFERENCES builds(id)
+            );
+            INSERT INTO builds (name, status, created_at)
+                VALUES ('legacy', 'succeeded', '2026-01-01T00:00:00+00:00');
+            INSERT INTO steps
+                (build_id, step_uid, command, depends_on, timeout_seconds,
+                 status, log_path)
+                VALUES (1, 'old', 'true', '[]', 5, 'succeeded', '/tmp/old.log');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    srv = ServerHarness(data_dir, _free_port())
+    srv.start()
+    try:
+        detail = srv.client.get("/builds/1").json()
+        assert detail["status"] == "succeeded"
+        step_out = step_map(detail)["old"]
+        assert step_out["approval_required"] is False
+        assert step_out["approval_status"] == "none"
+        new_id = submit(srv.client, "post-migration", [
+            {**step("gate", "true"), "approval_required": True},
+        ])
+        _wait_awaiting(srv.client, new_id, "gate")
+        assert _approve(srv.client, new_id, "gate", "approve").status_code == 200
+        assert wait_build(srv.client, new_id)["status"] == "succeeded"
+    finally:
+        srv.stop()
+
+
+def test_openapi_documents_approval_endpoints(server):
+    spec = server.client.get("/openapi.json").json()
+    assert "/approvals" in spec["paths"]
+    assert "/builds/{build_id}/steps/{step_id}/approval" in spec["paths"]
+    step_schema = spec["components"]["schemas"]["StepIn"]
+    assert "approval_required" in step_schema["properties"]
+    approval_schema = spec["components"]["schemas"]["ApprovalIn"]
+    assert set(approval_schema["properties"]) >= {"decision", "decided_by", "comment"}

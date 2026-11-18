@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""示例构建演示脚本：向运行中的流水线 API 依次提交三个示例并打印结果。
+"""示例构建演示脚本：向运行中的流水线 API 依次提交示例并打印结果。
 
 用法:
   python examples/run_demo.py [BASE_URL]
 默认 BASE_URL=http://127.0.0.1:8000
+
+门禁示例会先等待进入待签核、展示 /approvals 输出，再自动批准，演示完整链路。
 """
 from __future__ import annotations
 
@@ -15,7 +17,20 @@ from pathlib import Path
 import httpx
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
-EXAMPLES = ["success_build.json", "failure_build.json", "slow_child_build.json"]
+EXAMPLES = [
+    "success_build.json",
+    "gate_build.json",
+    "failure_build.json",
+    "slow_child_build.json",
+]
+
+
+def _wait(client: httpx.Client, build_id: int, predicate) -> dict:
+    while True:
+        detail = client.get(f"/builds/{build_id}").json()
+        if predicate(detail):
+            return detail
+        time.sleep(0.25)
 
 
 def main(base_url: str) -> int:
@@ -28,11 +43,28 @@ def main(base_url: str) -> int:
             resp.raise_for_status()
             build_id = resp.json()["id"]
 
-            while True:
-                detail = client.get(f"/builds/{build_id}").json()
-                if detail["status"] in TERMINAL:
-                    break
-                time.sleep(0.25)
+            gates = [s["id"] for s in payload["steps"] if s.get("approval_required")]
+            if gates:
+                detail = _wait(
+                    client,
+                    build_id,
+                    lambda d: any(
+                        s["status"] == "awaiting_approval" for s in d["steps"]
+                    ),
+                )
+                print(f"构建 #{build_id} 等待质检签核，/approvals 当前内容:")
+                print(json.dumps(client.get("/approvals").json(),
+                                 ensure_ascii=False, indent=2))
+                for gate in gates:
+                    decision = client.post(
+                        f"/builds/{build_id}/steps/{gate}/approval",
+                        json={"decision": "approve", "decided_by": "demo-qa",
+                              "comment": "演示自动批准"},
+                    )
+                    print(f"  门禁 {gate} 签核结果: {decision.status_code} "
+                          f"{decision.json().get('approval_status')}")
+
+            detail = _wait(client, build_id, lambda d: d["status"] in TERMINAL)
 
             print(f"构建 #{build_id} 最终状态: {detail['status']} ({detail.get('detail')})")
             for step in detail["steps"]:

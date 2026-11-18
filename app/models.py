@@ -1,16 +1,20 @@
 """请求/响应模型与 DAG 校验。"""
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config
 
 # 步骤与构建的状态机
 # pending 未启动 / running 运行中 / cleaning_up 主进程已退出，正在清空进程组
-# succeeded / failed / skipped / cancelled / interrupted 均为终态
-STEP_TERMINAL = {"succeeded", "failed", "skipped", "cancelled", "interrupted"}
+# awaiting_approval 人工门禁等待签核，不占用执行名额
+# rejected 人工门禁被拒绝，后代按失败向上游规则跳过
+# succeeded / failed / skipped / cancelled / interrupted / rejected 均为终态
+STEP_TERMINAL = {
+    "succeeded", "failed", "skipped", "cancelled", "interrupted", "rejected"
+}
 BUILD_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 
 # 取消/超时后清理时采用的终态
@@ -20,14 +24,17 @@ TIMEOUT_TERMINAL = "failed"
 
 class StepIn(BaseModel):
     id: Annotated[str, Field(min_length=1, max_length=128)]
-    command: Annotated[str, Field(min_length=1, max_length=8192)]
+    command: Optional[Annotated[str, Field(min_length=1, max_length=8192)]] = None
     depends_on: list[str] = Field(default_factory=list)
     timeout_seconds: Annotated[float, Field(gt=0, le=config.TIMEOUT_CAP_SECONDS)]
+    # 人工放行门禁：命令跑完后不直接判成功，而是进入 awaiting_approval
+    # 等待签核；只有批准后后代才会被调度。
+    approval_required: bool = False
 
     @field_validator("id", "command")
     @classmethod
-    def _no_surrounding_whitespace(cls, v: str) -> str:
-        if v != v.strip():
+    def _no_surrounding_whitespace(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v != v.strip():
             raise ValueError("字符串首尾不允许空白字符")
         return v
 
@@ -38,6 +45,14 @@ class StepIn(BaseModel):
             raise ValueError("依赖列表存在重复")
         return v
 
+    @model_validator(mode="after")
+    def _command_consistency(self) -> "StepIn":
+        # 普通步骤必须提供命令；门禁步骤（approval_required）命令可省略，
+        # 省略时仅做签核门禁，不执行任何进程。
+        if self.command is None and not self.approval_required:
+            raise ValueError("非门禁步骤必须提供 command")
+        return self
+
 
 class BuildCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=128)]
@@ -46,7 +61,7 @@ class BuildCreate(BaseModel):
 
 class StepOut(BaseModel):
     id: str
-    command: str
+    command: Optional[str]
     depends_on: list[str]
     timeout_seconds: float
     status: str
@@ -54,6 +69,54 @@ class StepOut(BaseModel):
     detail: Optional[str]
     started_at: Optional[str]
     finished_at: Optional[str]
+    approval_required: bool = False
+    approval_status: str = "none"
+    approval_requested_at: Optional[str] = None
+    approval_decided_at: Optional[str] = None
+    approval_decided_by: Optional[str] = None
+    approval_comment: Optional[str] = None
+
+
+class ApprovalIn(BaseModel):
+    decision: Literal["approve", "reject"]
+    decided_by: Optional[Annotated[str, Field(min_length=1, max_length=128)]] = None
+    comment: Optional[Annotated[str, Field(max_length=2000)]] = None
+
+    @field_validator("decided_by", "comment")
+    @classmethod
+    def _strip_optional(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class ApprovalOut(BaseModel):
+    build_id: int
+    step_id: str
+    decision: Literal["approve", "reject"]
+    decision_result: str
+    status: str
+    approval_status: str
+    approval_decided_at: str
+    approval_decided_by: Optional[str]
+    approval_comment: Optional[str]
+    detail: str
+
+
+class AwaitingApprovalOut(BaseModel):
+    """待签核门禁视图：显式列出构建与门禁步骤，便于质检员轮询。"""
+
+    build_id: int
+    build_name: str
+    build_status: str
+    step_id: str
+    command: Optional[str]
+    depends_on: list[str]
+    status: str
+    approval_status: str
+    approval_requested_at: Optional[str]
+    started_at: Optional[str]
 
 
 class BuildOut(BaseModel):

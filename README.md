@@ -1,7 +1,8 @@
 # 固件构建流水线 API
 
 FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG，在挂载工作目录中
-执行真实 shell 命令，全局最多 2 步并行，带依赖调度、取消、超时、进程组清理和重启恢复。
+执行真实 shell 命令，全局最多 2 步并行，带依赖调度、取消、超时、进程组清理、
+人工放行门禁和重启恢复。
 
 ## 功能与语义对照
 
@@ -11,7 +12,7 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 挂载工作目录执行真实命令 | 每构建独立目录 `$PIPELINE_DATA_DIR/workdir/<build_id>/`，compose 挂载命名卷 `/data` |
 | 全局最多两步并行 | 单 worker 内 `asyncio.Semaphore(2)`，名额覆盖步骤全生命周期 |
 | 依赖全成功才启动 | 调度器按 DAG 推进，依赖未全部 `succeeded` 不启动 |
-| 失败使后代跳过，独立分支继续 | 上游出现失败/取消/中断即置后代 `skipped`；无依赖关系的分支不受影响 |
+| 失败使后代跳过，独立分支继续 | 上游出现失败/取消/中断/门禁拒绝即置后代 `skipped`；无依赖关系的分支不受影响 |
 | 整次取消停止所有未完成步骤 | `POST /builds/{id}/cancel`，per-build 事件即时通知；未启动步骤不再启动 |
 | 超时/取消终止对应进程组 | 每步 `start_new_session=True` 独立进程组，`killpg(PGID, SIGTERM→SIGKILL)` |
 | 主命令退出后慢子进程清理并判失败 | 退出后扫描 `/proc` 检查组内残留，有残留即清理且步骤判 `failed` |
@@ -20,11 +21,30 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 重启先清理旧残留再标中断 | startup 恢复：PID+starttime 双重身份确认后终止旧组，再统一置 `interrupted` |
 | 未跑步骤不再启动、不误杀后来构建 | 恢复不恢复调度；身份不符（PID 复用）的进程绝不触碰 |
 | 重复取消不改终态 | 终态构建上的取消请求幂等忽略，返回说明，不写库 |
+| 人工放行门禁 | 步骤加 `"approval_required": true`；依赖全成功后进入 `awaiting_approval`，**不占两个执行名额**，独立分支照常运行 |
+| 待签核查询 | `GET /approvals` 列出待签核构建与门禁步骤；`GET /builds/{id}` 中步骤带 `approval_*` 字段 |
+| 按构建号+门禁步骤签核 | `POST /builds/{id}/steps/{sid}/approval`，body `{"decision":"approve"|"reject"}`；仅当前待签核门禁受理一次结论，重复/过期请求 409 |
+| 批准后才放行后代 | 批准把门禁落 `succeeded`，调度器**再次核对构建未取消**后才启动后代 |
+| 拒绝则跳过后代 | 拒绝把门禁落 `rejected`，后代按"上游未成功"规则 `skipped`，构建 `failed` |
+| 签核与取消交错 | 取消优先且与"检查取消 → spawn"共用构建级锁；已取消构建绝不启动命令，待签核门禁落 `cancelled` |
+| 重启后旧签核不补跑 | 未完成构建统一 `interrupted`；未结论的签核请求置 `expired`，恢复不重新调度 |
 | 逐步状态与日志 | `GET /builds/{id}` 全量状态；`GET /builds/{id}/steps/{sid}/logs`（支持 `?tail=N`） |
 
 步骤状态机：`pending → running → cleaning_up → succeeded|failed|cancelled|interrupted`，
-失败后代为 `skipped`。构建终态：全部成功 `succeeded`；有失败 `failed`；
+门禁步骤为 `pending → running → awaiting_approval → succeeded|rejected`
+（取消时从任一非终态落 `cancelled`），失败/拒绝后代为 `skipped`。
+构建终态：全部成功 `succeeded`；有失败或门禁拒绝 `failed`；
 取消导致的终止 `cancelled`；重启中断 `interrupted`。
+
+### 人工放行门禁语义
+
+- 门禁是 DAG 中的普通节点，可带命令（命令须成功且进程组清空后才进入待签核），
+  也可省略 `command` 做成纯签核占位门禁；非门禁步骤仍必须提供命令。
+- 进入 `awaiting_approval` 后**不持有执行名额**，因此不会挤占全局两个名额，
+  与门禁无依赖关系的独立分支/独立构建照常运行。
+- 签核接口只有一次有效结论；批准/拒绝后门禁离开待签核，重复提交返回 409。
+- 批准只是"允许调度"，后代真正启动前调度器与启动锁会再次检查取消标记，
+  因此"批准后立刻取消"不会让已取消构建的命令被执行。
 
 ## 快速启动（Docker Compose）
 
@@ -48,9 +68,10 @@ PIPELINE_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0
 
 ## 示例构建
 
-`examples/` 下提供三类（另含超时示例）：
+`examples/` 下提供以下示例：
 
 - `success_build.json` — prepare → compile → unit-test → package 全成功链路
+- `gate_build.json` — 编译/测试后进入人工质检签核门禁，批准后才打包待烧录固件
 - `failure_build.json` — 编译失败、后代跳过、独立分支继续
 - `slow_child_build.json` — 主命令退出 0 但派生 `sleep 300` 慢子进程，验证清理与判失败
 - `timeout_build.json` — 2s 超时终止睡眠 60s 的进程组
@@ -61,12 +82,25 @@ PIPELINE_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0
 .venv/bin/python examples/run_demo.py            # 默认 http://127.0.0.1:8000
 ```
 
-手动提交：
+手动提交门禁构建并签核：
 
 ```bash
 curl -s -X POST localhost:8000/builds \
   -H 'Content-Type: application/json' \
-  --data @examples/success_build.json
+  --data @examples/gate_build.json
+curl -s localhost:8000/approvals                 # 待签核构建与门禁步骤
+curl -s -X POST localhost:8000/builds/1/steps/quality-signoff/approval \
+  -H 'Content-Type: application/json' \
+  -d '{"decision":"approve","decided_by":"qa-1","comment":"测试通过"}'
+# 拒绝: -d '{"decision":"reject","decided_by":"qa-1","comment":"不合格"}'
+curl -s localhost:8000/builds/1
+curl -s localhost:8000/builds/1/steps/quality-signoff/logs
+```
+
+其他常用请求：
+
+```bash
+curl -s -X POST localhost:8000/builds --data @examples/success_build.json
 curl -s localhost:8000/builds/1
 curl -s localhost:8000/builds/1/steps/compile/logs
 curl -s -X POST localhost:8000/builds/1/cancel
@@ -78,11 +112,22 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | --- | --- | --- |
 | POST | `/builds` | 提交 DAG 构建（201 返回含逐步状态） |
 | GET | `/builds?limit=N` | 构建列表（新→旧） |
-| GET | `/builds/{id}` | 构建与全部步骤状态 |
+| GET | `/builds/{id}` | 构建与全部步骤状态（含 `approval_*` 字段） |
 | POST | `/builds/{id}/cancel` | 整次取消（幂等） |
+| GET | `/approvals?limit=N` | 当前待签核的构建与门禁步骤 |
+| POST | `/builds/{id}/steps/{step_id}/approval` | 提交一次签核结论（approve/reject） |
 | GET | `/builds/{id}/steps/{step_id}/logs?tail=N` | 步骤日志 |
-| GET | `/health` | 健康检查与最近一次启动恢复报告 |
-| GET | `/docs` | Swagger UI |
+| GET | `/health` | 健康检查、待签核门禁数、最近一次启动恢复报告 |
+| GET | `/docs` | Swagger UI（含签核请求模型与可交互调用） |
+
+签核请求体：
+
+```json
+{"decision": "approve", "decided_by": "qa-1", "comment": "测试通过"}
+```
+
+`decision` 仅接受 `approve` / `reject`（其他值 422）；`decided_by`、`comment` 可选。
+仅当前待签核门禁受理一次结论，重复或过期提交返回 409；构建/步骤不存在返回 404。
 
 ## 进程组与重启恢复的关键设计
 
@@ -96,6 +141,9 @@ curl -s -X POST localhost:8000/builds/1/cancel
    后来构建进程不会被误杀。组长已死但组内仍有成员时，因 PGID 不可能被复用，
    残留成员仍会被清理。
 5. 恢复在应用开始接受请求前完成；旧构建统一置 `interrupted`，调度不恢复。
+6. 人工签核请求同样不跨重启：未结论的待签核在恢复时置 `expired`，已有结论
+   保持原样但该构建已中断，后代不会因旧签核补跑。旧库升级时启动会自动补齐
+   签核列（`ALTER TABLE`），不影响既有构建数据。
 
 ## 测试
 
@@ -103,10 +151,13 @@ curl -s -X POST localhost:8000/builds/1/cancel
 .venv/bin/python -m pytest tests/ -v
 ```
 
-- `tests/test_validation.py`：DAG 校验、12 步上限、超时正数、进程身份识别。
+- `tests/test_validation.py`：DAG 校验、12 步上限、超时正数、门禁命令可选性、
+  进程身份识别。
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
-  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口；门禁部分覆盖
+  待签核阻塞后代、批准放行、拒绝跳过、重复结论 409、待签核取消与批准后取消
+  交错、门禁不占名额、重启作废旧签核、旧库自动迁移与 OpenAPI 暴露。
 
 ## 配置（环境变量）
 

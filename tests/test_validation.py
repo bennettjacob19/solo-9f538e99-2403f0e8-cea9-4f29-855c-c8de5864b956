@@ -86,3 +86,33 @@ def test_starttime_identity_guard():
     assert is_same_process(2_000_000, 123) is False
     # starttime 缺失时保守拒绝
     assert is_same_process(my_pid, None) is False
+
+
+def test_command_optional_only_for_gate_steps():
+    gate = BuildCreate(
+        name="n",
+        steps=[{"id": "gate", "depends_on": [], "timeout_seconds": 5,
+                "approval_required": True}],
+    )
+    assert gate.steps[0].command is None
+    with pytest.raises(ValidationError):
+        BuildCreate(
+            name="n",
+            steps=[{"id": "plain", "depends_on": [], "timeout_seconds": 5}],
+        )
+
+
+def test_empty_gate_command_rejected():
+    with pytest.raises(ValidationError):
+        BuildCreate(
+            name="n",
+            steps=[{"id": "gate", "command": "", "depends_on": [],
+                    "timeout_seconds": 5, "approval_required": True}],
+        )
+
+
+def test_step_terminal_states_include_rejected():
+    from app.models import STEP_TERMINAL
+
+    assert "rejected" in STEP_TERMINAL
+    assert "awaiting_approval" not in STEP_TERMINAL

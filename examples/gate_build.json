@@ -1,0 +1,30 @@
+{
+  "name": "example-manual-gate",
+  "steps": [
+    {
+      "id": "compile",
+      "command": "echo 'compiling firmware...' && echo 'build ok' > firmware.bin",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "unit-test",
+      "command": "test -f firmware.bin && echo 'all tests passed'",
+      "depends_on": ["compile"],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "quality-signoff",
+      "command": "echo '固件质检报告已生成'",
+      "depends_on": ["unit-test"],
+      "timeout_seconds": 10,
+      "approval_required": true
+    },
+    {
+      "id": "package-for-flash",
+      "command": "test -f firmware.bin && tar -czf firmware.tar.gz firmware.bin && echo packaged",
+      "depends_on": ["quality-signoff"],
+      "timeout_seconds": 10
+    }
+  ]
+}
